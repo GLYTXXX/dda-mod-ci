@@ -41,8 +41,9 @@ jobs:
       # 从上一个 job 的输出中读取 matrix 配置
       matrix: ${{ fromJSON(needs.fetch_release.outputs.releases) }}
     
-    runs-on: ubuntu-latest
-    name: Build for ${{ matrix.release }} # Job 的显示名称
+    runs-on: ubuntu-22.04 # <--- 修改这里！从 latest 改为 22.04
+    
+    name: Build for ${{ matrix.release }}
     
     # 允许此 Job 写入内容（比如创建 Release）
     permissions:
