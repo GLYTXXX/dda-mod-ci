@@ -1,127 +1,103 @@
 name: Build and upload test suite
 
 on:
+  # 允许手动触发
   workflow_dispatch:
+  # 每天定时运行两次（UTC时间 6:40 和 18:40）
   schedule:
     - cron: '40 6,18 * * *'
-#  push:
-#    branches:
-#    - main
-    
-#concurrency:
-#  group: test-build-${{ github.event.pull_request.number || github.ref_name }}
-#  cancel-in-progress: true
 
 jobs:
+  # --- 第一个 Job: 获取最新的官方 Release 标签 ---
   fetch_release:
     runs-on: ubuntu-latest
-    outputs: 
+    outputs:
+      # 将结果输出，供下一个 Job 使用
       releases: ${{ steps.fetch.outputs.releases }}
     steps:
-      - env:
+      - name: Fetch latest CDDA release tag
+        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         id: fetch
         run: |
-          gh api \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            /repos/CleverRaven/Cataclysm-DDA/releases?per_page=1 > data.json
-          matrix=$(
-            echo '{ "release" : '
-            (jq '[.[]|.tag_name]' data.json | sed 's/[[:space:]]//g')
-            echo '}'
-              )
-          matrix=$(echo $matrix | sed ':a;N;$!ba;s/\n/;/g') 
-          matrix1="{ \"release\" : [ \"cdda-experimental-2023-07-23-0530\", \"cdda-experimental-2023-07-22-2222\" ] }"
-          echo $matrix1
-          echo $matrix
+          # 使用 GitHub API 获取 CleverRaven/Cataclysm-DDA 最新的一个 release
+          gh api /repos/CleverRaven/Cataclysm-DDA/releases?per_page=1 > data.json
+          
+          # 使用 jq 将 release 的 tag_name 提取出来，并构造成 matrix 所需的 JSON 格式
+          matrix=$(jq '{ "release": [.[] | .tag_name] }' data.json)
+          
+          echo "Generated Matrix: $matrix"
           echo "releases=$matrix" >> $GITHUB_OUTPUT
- # check-matrix:
- #   runs-on: ubuntu-latest
- #   needs: fetch_release
- #   steps:
- #     - name: Check matrix definition
- #       run: |
- #         matrix='${{ needs.fetch_release.outputs.releases }}'
- #         echo $matrix
- #         echo $matrix | jq .
-    matrix_build:
+
+  # --- 第二个 Job: 根据获取到的标签，构建并上传测试程序 ---
+  matrix_build:
+    # 依赖 fetch_release job 完成
     needs: [ fetch_release ]
     strategy:
       fail-fast: false
+      # 从上一个 job 的输出中读取 matrix 配置
       matrix: ${{ fromJSON(needs.fetch_release.outputs.releases) }}
+    
     runs-on: ubuntu-latest
-    name: ${{ matrix.release }}
+    name: Build for ${{ matrix.release }} # Job 的显示名称
+    
+    # 允许此 Job 写入内容（比如创建 Release）
+    permissions:
+      contents: write # 允许对仓库内容进行写操作
+      packages: write # 允许对包进行写操作
+      
     env:
-      ZSTD_CLEVEL: 17
       COMPILER: clang++-13 # 指定使用 Clang 13
       TILES: 0
       SOUND: 0
       LOCALIZE: 0
-      MODS:
-      EXTRA_TEST_OPTS: --error-format=github-action
       PCH: 1
       RELEASE: 1
-      ARCHIVE_SUCCESS: basic-build
-      CCACHE_LIMIT: 2G
-      CCACHE_FILECLONE: true
-      CCACHE_HARDLINK: true
-      CCACHE_NOCOMPRESS: true
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    permissions: write-all
+
     steps:
-    - name: checkout myself
-      uses: actions/checkout@v3
-
-    - name: release
+    - name: 1. Create Release Placeholder
+      # 提前在当前仓库创建一个空的 Release，用于之后上传附件
+      # 如果 Release 已存在，此命令会失败但不会中断工作流，这是预期的行为
       run: |
-        # 创建一个空的 Release，用于之后上传附件
-        gh release create ${{matrix.release}} --title ${{matrix.release}} --notes "Automated build of the test suite for this version."
-
-    - name: checkout repository
+        gh release create ${{ matrix.release }} --title "Test Suite for ${{ matrix.release }}" --notes "Automated build of the test suite for this version." || echo "Release already exists, continuing."
+        
+    - name: 2. Checkout CDDA Source Code
+      # 拉取与 matrix.release 标签版本完全对应的官方 CDDA 源码
       uses: actions/checkout@v4
       with:
         repository: 'CleverRaven/Cataclysm-DDA'
         ref: ${{ matrix.release }}
 
-    - name: install dependencies (ubuntu)
+    - name: 3. Install Build Dependencies
       run: |
-          sudo apt-get update
-          # 在这里把 clang-13 添加到安装列表！
-          sudo apt-get install -y clang-13 libncursesw5-dev ccache gettext parallel
-          sudo locale-gen en_US.UTF-8 de_DE.UTF-8
+        sudo apt-get update
+        # 核心修复：在这里安装 clang-13
+        sudo apt-get install -y clang-13 libncursesw5-dev ccache gettext parallel patch
+        sudo locale-gen en_US.UTF-8 de_DE.UTF-8
 
-    - name: mogai (Apply Patches)
+    - name: 4. Apply Patches
       run: |
-        # 克隆包含补丁的仓库
-        git clone https://github.com/SurFlurer/dda-mod-ci/ modci
+        # 克隆包含补丁文件的仓库到临时目录
+        git clone https://github.com/SurFlurer/dda-mod-ci.git modci_repo --depth=1
         
-        # 设置 Git 用户信息，git am 需要这个
+        # 设置 Git 用户信息，git am 需要它
         git config --global user.email "runner@github.com"
-        git config --global user.name "runner"
+        git config --global user.name "GitHub Action Runner"
+        
+        # 应用补丁来创建一个“宽容版”的源码
+        # 使用 --directory=. 来确保补丁在当前 CDDA 源码目录应用
+        git apply modci_repo/patch/0001-disable-test-mode.patch
+        git apply modci_repo/patch/0004-no-check-mattack-overwrite.patch
 
-        # 应用补丁。使用 git am 更健壮
-        git am modci/patch/0001-disable-test-mode.patch
-        git am modci/patch/0004-no-check-mattack-overwrite.patch
-        # 注意：原文件里有一个被注释掉的补丁，这里也保持注释
-        # git am modci/patch/0002-stop-checking-too-many-mattacks-of-a-type.patch
-
-    - name: prepare
+    - name: 5. Prepare for Build
       run: bash ./build-scripts/requirements.sh
 
-    - name: build
+    - name: 6. Build the Test Suite
+      # 运行编译脚本，生成 cata_test 程序
       run: bash ./build-scripts/gha_compile_only.sh
 
-    - name: mv exe (Prepare artifact)
+    - name: 7. Upload Test Suite to Release
+      # 上传编译好的 cata_test 文件到之前创建的 Release
       run: |
-         # 将编译好的测试程序移动到根目录，方便上传
-         mv tests/cata_test ../
-
-    - name: checkout myself (to get context for upload)
-      # 这一步是为了让 gh release upload 命令能正确工作
-      uses: actions/checkout@v3
-
-    - name: upload executable
-      run: |
-       # 上传编译好的 cata_test 文件到之前创建的 Release
-       gh release upload ${{ matrix.release }} ../cata_test
+        gh release upload ${{ matrix.release }} tests/cata_test --clobber
