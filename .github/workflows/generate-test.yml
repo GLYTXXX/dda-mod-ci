@@ -45,7 +45,7 @@ jobs:
  #         matrix='${{ needs.fetch_release.outputs.releases }}'
  #         echo $matrix
  #         echo $matrix | jq .
-  matrix_build:
+    matrix_build:
     needs: [ fetch_release ]
     strategy:
       fail-fast: false
@@ -54,7 +54,7 @@ jobs:
     name: ${{ matrix.release }}
     env:
       ZSTD_CLEVEL: 17
-      COMPILER: clang++-13
+      COMPILER: clang++-13 # 指定使用 Clang 13
       TILES: 0
       SOUND: 0
       LOCALIZE: 0
@@ -72,45 +72,56 @@ jobs:
     steps:
     - name: checkout myself
       uses: actions/checkout@v3
+
     - name: release
       run: |
-        gh release create ${{matrix.release}} --title ${{matrix.release}}
+        # 创建一个空的 Release，用于之后上传附件
+        gh release create ${{matrix.release}} --title ${{matrix.release}} --notes "Automated build of the test suite for this version."
+
     - name: checkout repository
       uses: actions/checkout@v4
       with:
         repository: 'CleverRaven/Cataclysm-DDA'
         ref: ${{ matrix.release }}
+
     - name: install dependencies (ubuntu)
       run: |
           sudo apt-get update
-          sudo apt-get install libncursesw5-dev ccache gettext parallel
+          # 在这里把 clang-13 添加到安装列表！
+          sudo apt-get install -y clang-13 libncursesw5-dev ccache gettext parallel
           sudo locale-gen en_US.UTF-8 de_DE.UTF-8
-    #- name: install SDL2 dependencies (ubuntu)
-    #  run: |
-    #      sudo apt-get install libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libsdl2-mixer-dev libpulse-dev libflac-dev
-    - name: mogai
+
+    - name: mogai (Apply Patches)
       run: |
-        mkdir modci
-        cd modci
-        git clone https://github.com/SurFlurer/dda-mod-ci/
-        cd ..
+        # 克隆包含补丁的仓库
+        git clone https://github.com/SurFlurer/dda-mod-ci/ modci
+        
+        # 设置 Git 用户信息，git am 需要这个
         git config --global user.email "runner@github.com"
         git config --global user.name "runner"
-        git am modci/dda-mod-ci/patch/0001-disable-test-mode.patch
-        # git am modci/dda-mod-ci/patch/0002-stop-checking-too-many-mattacks-of-a-type.patch
-        git am modci/dda-mod-ci/patch/0004-no-check-mattack-overwrite.patch
+
+        # 应用补丁。使用 git am 更健壮
+        git am modci/patch/0001-disable-test-mode.patch
+        git am modci/patch/0004-no-check-mattack-overwrite.patch
+        # 注意：原文件里有一个被注释掉的补丁，这里也保持注释
+        # git am modci/patch/0002-stop-checking-too-many-mattacks-of-a-type.patch
+
     - name: prepare
       run: bash ./build-scripts/requirements.sh
+
     - name: build
       run: bash ./build-scripts/gha_compile_only.sh
-    - name: mv exe
+
+    - name: mv exe (Prepare artifact)
       run: |
-         # mv cataclysm-tiles ../
-          mv tests/cata_test ../
-    - name: checkout myself
+         # 将编译好的测试程序移动到根目录，方便上传
+         mv tests/cata_test ../
+
+    - name: checkout myself (to get context for upload)
+      # 这一步是为了让 gh release upload 命令能正确工作
       uses: actions/checkout@v3
+
     - name: upload executable
       run: |
-       # gh release upload ${{ matrix.release }} ../cataclysm-tiles
-        gh release upload ${{ matrix.release }} ../cata_test
-      
+       # 上传编译好的 cata_test 文件到之前创建的 Release
+       gh release upload ${{ matrix.release }} ../cata_test
